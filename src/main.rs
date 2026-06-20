@@ -1,8 +1,12 @@
 mod event_finder;
 
-use std::{fs::OpenOptions, io::Write, os::fd::AsRawFd};
-
+use std::{fs::OpenOptions, io::Write, os::fd::AsRawFd, time::{Duration, Instant}};
 use evdev::{uinput::VirtualDevice, *};
+
+/*
+ * TODO: Add Sigev that ungrabs and brigtness off when prog exits
+ *
+ * */
 
 #[derive(PartialEq)]
 enum Brightness {
@@ -18,7 +22,8 @@ struct Touchpad {
     x: i32,
     y: i32,
     numlock: bool,
-    brightness: Brightness
+    brightness: Brightness,
+    touch_start: Option<Instant>,
 }
 
 const ROWS: usize = 4;
@@ -28,17 +33,17 @@ const I2C_SLAVE_FORCE: libc::c_ulong = 0x0706;
 const NUMPAD_LAYOUT: [[KeyCode; 5]; 4] = [
     [KeyCode::KEY_KP7, KeyCode::KEY_KP8,   KeyCode::KEY_KP9,   KeyCode::KEY_KPSLASH,    KeyCode::KEY_BACKSPACE],
     [KeyCode::KEY_KP4, KeyCode::KEY_KP5,   KeyCode::KEY_KP6,   KeyCode::KEY_KPASTERISK, KeyCode::KEY_BACKSPACE],
-    [KeyCode::KEY_KP1, KeyCode::KEY_KP2,   KeyCode::KEY_KP3,   KeyCode::KEY_MINUS,      KeyCode::KEY_RESERVED], // %
+    [KeyCode::KEY_KP1, KeyCode::KEY_KP2,   KeyCode::KEY_KP3,   KeyCode::KEY_MINUS,      KeyCode::KEY_5], // %
     [KeyCode::KEY_KP0, KeyCode::KEY_KPDOT, KeyCode::KEY_ENTER, KeyCode::KEY_KPPLUS,     KeyCode::KEY_KPEQUAL]
 ];
 
 fn main() {
     let (mouse, id) = event_finder::find_event().unwrap();
-    dbg!(id);
     let mut device = Device::open(format!("/dev/input/event{}", mouse)).unwrap();
 
     let mut keys = AttributeSet::<KeyCode>::new();
     keys.insert(KeyCode::KEY_NUMLOCK);
+    keys.insert(KeyCode::KEY_LEFTSHIFT);
     for i in NUMPAD_LAYOUT {
         for j in i {
             keys.insert(j);
@@ -78,19 +83,21 @@ fn main() {
         x: 0,
         y: 0,
         numlock: false,
-        brightness: Brightness::OFF
+        brightness: Brightness::OFF,
+        touch_start: None
     };
 
     loop {
         for event in device.fetch_events().unwrap() {
             match event.destructure() {
-                EventSummary::Key(_, code, value) => {
-                    match code {
-                        KeyCode::BTN_TOOL_FINGER => {
-                            // Write to device
-                            if value == 0 {
-                                handle_numpad(&mut touchpad_conf);
-                            }
+                EventSummary::Key(_, KeyCode::BTN_TOOL_FINGER, value) => {
+                    match value {
+                        1 => {
+                            touchpad_conf.touch_start = Some(Instant::now());
+                        },
+                        0 => {
+                            handle_numpad(&mut touchpad_conf);
+                            touchpad_conf.touch_start = None;
                         },
                         _ => {}
                     }
@@ -121,6 +128,7 @@ fn main() {
 }
 
 fn handle_numpad(touchpad: &mut Touchpad) {
+    /**** Top Left ****/
     if ((touchpad.x as f64) < 0.06 * (touchpad.max_x as f64)) && ((touchpad.y as f64) < 0.07 * (touchpad.max_y as f64)) {
         dbg!("Top Left");
         /*
@@ -131,7 +139,17 @@ fn handle_numpad(touchpad: &mut Touchpad) {
         return;
     }
 
+    /**** Top Right ****/
     if ((touchpad.x as f64) > 0.95 * (touchpad.max_x as f64)) && ((touchpad.y as f64) < 0.09 * (touchpad.max_y as f64)) {
+        if let None = touchpad.touch_start {
+            return;
+        }
+
+        let elapsed = touchpad.touch_start.unwrap().elapsed(); // Safe unwrap
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+
         match touchpad.numlock {
             true => {
                 dbg!("brightness to OFF");
@@ -166,7 +184,16 @@ fn handle_numpad(touchpad: &mut Touchpad) {
 
     let key = NUMPAD_LAYOUT[row][col];
 
-    println!("Key: {:?}", key);
+    if key == KeyCode::KEY_5 {
+        // % Key
+        touchpad.numpad.emit(&[
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 1),
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 0),
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0),
+        ]).unwrap();
+        return;
+    }
 
     touchpad.numpad.emit(&[
         InputEvent::new(EventType::KEY.0, key.0, 1),
