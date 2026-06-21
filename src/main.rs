@@ -24,7 +24,7 @@ struct Touchpad {
 const ROWS: usize = 4;
 const COLS: usize = 5;
 const I2C_SLAVE_FORCE: libc::c_ulong = 0x0706;
-const TOUCH_DURATION_S: u64 = 1;
+const TOUCH_DURATION_S: f64 = 0.5;
 
 const NUMPAD_LAYOUT: [[KeyCode; 5]; 4] = [
     [KeyCode::KEY_KP7, KeyCode::KEY_KP8,   KeyCode::KEY_KP9,   KeyCode::KEY_KPSLASH,    KeyCode::KEY_BACKSPACE],
@@ -132,7 +132,7 @@ fn handle_numpad(touchpad: &mut Touchpad) {
         }
 
         let elapsed = touchpad.touch_start.unwrap().elapsed(); // Safe unwrap
-        if elapsed < Duration::from_secs(TOUCH_DURATION_S) {
+        if elapsed < Duration::from_secs_f64(TOUCH_DURATION_S) {
             return;
         }
 
@@ -150,7 +150,7 @@ fn handle_numpad(touchpad: &mut Touchpad) {
         }
 
         let elapsed = touchpad.touch_start.unwrap().elapsed(); // Safe unwrap
-        if elapsed < Duration::from_secs(TOUCH_DURATION_S) {
+        if elapsed < Duration::from_secs_f64(TOUCH_DURATION_S) {
             return;
         }
 
