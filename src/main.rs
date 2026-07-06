@@ -3,10 +3,13 @@ mod event_finder;
 use std::{fs::OpenOptions, io::Write, os::fd::AsRawFd, time::{Duration, Instant}};
 use evdev::{uinput::VirtualDevice, *};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Brightness {
-    OFF,
-    ON
+    ON = 0x01,
+    LOW = 0x42,
+    MID = 0x45,
+    HIGH = 0x48,
+    OFF = 0x00,
 }
 
 struct Touchpad {
@@ -34,8 +37,21 @@ const NUMPAD_LAYOUT: [[KeyCode; 5]; 4] = [
 ];
 
 fn main() {
-    let (mouse, id) = event_finder::find_event().unwrap();
-    let mut device = Device::open(format!("/dev/input/event{}", mouse)).unwrap();
+    let (mouse, id) = match event_finder::find_event() {
+        Some((i, x)) => (i, x),
+        None => {
+            eprintln!("[!] Error: finding event and touchpad id!");
+            return;
+        }
+    };
+
+    let mut device = match Device::open(format!("/dev/input/event{}", mouse)) {
+        Ok(x) => x,
+        Err(err) => {
+            eprintln!("[!] Error: {err}!");
+            return;
+        }
+    };
 
     let mut keys = AttributeSet::<KeyCode>::new();
     keys.insert(KeyCode::KEY_NUMLOCK);
@@ -46,12 +62,25 @@ fn main() {
         }
     }
 
-    let numpad = VirtualDevice::builder()
-        .unwrap()
-        .name("Asus Numpad")
-        .with_keys(&keys)
-        .unwrap()
-        .build().unwrap();
+    let numpad = match VirtualDevice::builder() {
+        Ok(x) => match x.name("Asus Numpad") .with_keys(&keys) {
+            Ok(y) => match y.build() {
+                Ok(z) => z,
+                Err(err) => {
+                    eprintln!("[!] Error: {err}!");
+                    return;
+                }
+            },
+            Err(err) => {
+                eprintln!("[!] Error: {err}!");
+                return;
+            },
+        },
+        Err(err) => {
+            eprintln!("[!] Error: {err}!");
+            return;
+        },
+    };
 
     let (max_x, max_y) = {
         let mut max_x = 0;
@@ -114,19 +143,12 @@ fn main() {
                 _ => {}
             }
         }
-
-        if touchpad_conf.numlock {
-            device.grab().unwrap();
-        } else {
-            device.ungrab().unwrap();
-        }
     }
 }
 
 fn handle_numpad(touchpad: &mut Touchpad) {
     /**** Top Left ****/
     if ((touchpad.x as f64) < 0.06 * (touchpad.max_x as f64)) && ((touchpad.y as f64) < 0.07 * (touchpad.max_y as f64)) {
-        dbg!("Top Left");
         if let None = touchpad.touch_start {
             return;
         }
@@ -136,9 +158,14 @@ fn handle_numpad(touchpad: &mut Touchpad) {
             return;
         }
 
-        /*
-         * Handle Brightness
-         * */
+        touchpad.brightness = match touchpad.brightness {
+            Brightness::LOW => Brightness::MID,
+            Brightness::MID => Brightness::HIGH,
+            Brightness::HIGH => Brightness::LOW,
+            _ => Brightness::LOW,
+        };
+
+        change_brightness(touchpad);
 
         return;
     }
@@ -156,7 +183,6 @@ fn handle_numpad(touchpad: &mut Touchpad) {
 
         match touchpad.numlock {
             true => {
-                dbg!("brightness to OFF");
                 touchpad.brightness = Brightness::OFF;
                 change_brightness(touchpad);
                 touchpad.numpad.emit(&[
@@ -166,7 +192,8 @@ fn handle_numpad(touchpad: &mut Touchpad) {
                 touchpad.numlock = false;
             },
             false => {
-                dbg!("brightness to LOW");
+                touchpad.brightness = Brightness::LOW;
+                change_brightness(touchpad);
                 touchpad.brightness = Brightness::ON;
                 change_brightness(touchpad);
                 touchpad.numpad.emit(&[
@@ -188,46 +215,55 @@ fn handle_numpad(touchpad: &mut Touchpad) {
 
     let key = NUMPAD_LAYOUT[row][col];
 
-    if key == KeyCode::KEY_5 {
-        // % Key
-        touchpad.numpad.emit(&[
-            InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
-            InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 1),
-            InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 0),
-            InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0),
-        ]).unwrap();
-        return;
+    match key {
+        KeyCode::KEY_5 => touchpad.numpad.emit(&[
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 1),
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 0),
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0),
+            ]).unwrap(),
+
+        KeyCode::KEY_BACKSPACE => {},
+
+        _ => touchpad.numpad.emit(&[
+            InputEvent::new(EventType::KEY.0, key.0, 1),
+            InputEvent::new(EventType::KEY.0, key.0, 0),
+        ]).unwrap()
     }
-
-    touchpad.numpad.emit(&[
-        InputEvent::new(EventType::KEY.0, key.0, 1),
-        InputEvent::new(EventType::KEY.0, key.0, 0),
-
-    ]).unwrap();
 }
 
 fn change_brightness(touchpad: &Touchpad) {
-    let mut dev = OpenOptions::new()
+    let path = format!("/dev/i2c-{}", touchpad.dev_id);
+    dbg!(&path);
+    let dev = OpenOptions::new()
         .write(true)
         .read(true)
-        .open(format!("/dev/i2c-{}", touchpad.dev_id))
-        .unwrap();
+        .open(&path);
+
+    let mut dev = match dev {
+        Ok(x) => x,
+        Err(err) => {
+            eprintln!("[!] Error: {}", err);
+            return;
+        }
+    };
 
     let fd = dev.as_raw_fd();
+
     let ret = unsafe {
         libc::ioctl(fd, I2C_SLAVE_FORCE, 0x15)
     };
 
     if ret < 0 {
-        eprintln!("[!] Error: failed");
+        eprintln!("[!] Error: failed writting to {}", path);
         return;
     }
 
-    let mut data = [ 0x05, 0x00, 0x3d, 0x03, 0x06, 0x00, 0x07, 0x00, 0x0d, 0x14, 0x03, 0x00, 0xad]; // 12 byte
+    let brightness = touchpad.brightness as u8;
 
-    if let Brightness::ON = touchpad.brightness {
-        data[11] = 0x01;
+    let data = [ 0x05, 0x00, 0x3d, 0x03, 0x06, 0x00, 0x07, 0x00, 0x0d, 0x14, 0x03, brightness, 0xad ]; // 12 byte
+
+    if let Err(_) = dev.write_all(&data) {
+        eprintln!("[!] Error: writting to {}", path);
     }
-
-    let _ = dev.write_all(&data).unwrap();
 }
