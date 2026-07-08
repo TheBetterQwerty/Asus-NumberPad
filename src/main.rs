@@ -12,6 +12,11 @@ enum Brightness {
     OFF = 0x00,
 }
 
+const ROWS: usize = 5;
+const COLS: usize = 4;
+const I2C_SLAVE_FORCE: libc::c_ulong = 0x0706;
+const TOUCH_DURATION_S: f64 = 0.5;
+
 struct Touchpad {
     numpad: VirtualDevice,
     dev_id: u32,
@@ -19,17 +24,49 @@ struct Touchpad {
     max_y: i32,
     x: i32,
     y: i32,
+    row: usize,
+    col: usize,
     numlock: bool,
     brightness: Brightness,
     touch_start: Option<Instant>,
+    backspace: bool,
 }
 
-const ROWS: usize = 4;
-const COLS: usize = 5;
-const I2C_SLAVE_FORCE: libc::c_ulong = 0x0706;
-const TOUCH_DURATION_S: f64 = 0.5;
+impl Touchpad {
+    fn new(numpad: VirtualDevice, id: u32, x: i32, y: i32) -> Self {
+        Touchpad {
+            numpad,
+            dev_id: id,
+            max_x: x,
+            max_y: y,
+            x: 0,
+            y: 0,
+            row: 0,
+            col: 0,
+            numlock: false,
+            brightness: Brightness::OFF,
+            touch_start: None,
+            backspace: false,
+        }
+    }
 
-const NUMPAD_LAYOUT: [[KeyCode; 5]; 4] = [
+    fn key(&mut self) {
+        let col = f64::floor(COLS as f64 * self.x as f64 / (self.max_x as f64 + 1.0)) as usize;
+        let row = f64::floor((ROWS as f64 * self.y as f64 / (self.max_y as f64)) - 0.0) as usize;
+
+        self.col = match col {
+            i if i >= COLS => self.col,
+            _ => col
+        };
+
+        self.row = match row {
+            i if i >= ROWS => self.row,
+            _ => row
+        };
+    }
+}
+
+const NUMPAD_LAYOUT: [[KeyCode; ROWS]; COLS] = [
     [KeyCode::KEY_KP7, KeyCode::KEY_KP8,   KeyCode::KEY_KP9,   KeyCode::KEY_KPSLASH,    KeyCode::KEY_BACKSPACE],
     [KeyCode::KEY_KP4, KeyCode::KEY_KP5,   KeyCode::KEY_KP6,   KeyCode::KEY_KPASTERISK, KeyCode::KEY_BACKSPACE],
     [KeyCode::KEY_KP1, KeyCode::KEY_KP2,   KeyCode::KEY_KP3,   KeyCode::KEY_MINUS,      KeyCode::KEY_5], // %
@@ -100,17 +137,7 @@ fn main() {
         (max_x, max_y)
     };
 
-    let mut touchpad_conf = Touchpad {
-        numpad,
-        dev_id: id,
-        max_x,
-        max_y,
-        x: 0,
-        y: 0,
-        numlock: false,
-        brightness: Brightness::OFF,
-        touch_start: None
-    };
+    let mut touchpad = Touchpad::new(numpad, id, max_x, max_y);
 
     loop {
         for event in device.fetch_events().unwrap() {
@@ -118,23 +145,42 @@ fn main() {
                 EventSummary::Key(_, KeyCode::BTN_TOOL_FINGER, value) => {
                     match value {
                         1 => {
-                            touchpad_conf.touch_start = Some(Instant::now());
+                            if let true = touchpad.numlock {
+                                touchpad.key();
+                                if let KeyCode::KEY_BACKSPACE = NUMPAD_LAYOUT[touchpad.row][touchpad.col] {
+                                    touchpad.numpad.emit(&[
+                                        InputEvent::new(EventType::KEY.0, KeyCode::KEY_BACKSPACE.0, 1),
+                                    ]).unwrap();
+
+                                    touchpad.backspace = true;
+                                }
+                            }
+                            touchpad.touch_start = Some(Instant::now());
                         },
+
                         0 => {
-                            handle_numpad(&mut touchpad_conf);
-                            touchpad_conf.touch_start = None;
+                            if let true = touchpad.backspace {
+                                touchpad.numpad.emit(&[
+                                    InputEvent::new(EventType::KEY.0, KeyCode::KEY_BACKSPACE.0, 0),
+                                ]).unwrap();
+                                touchpad.backspace = false;
+                            }
+
+                            handle_numpad(&mut touchpad);
+                            touchpad.touch_start = None;
                         },
+
                         _ => {}
                     }
                 },
                 EventSummary::AbsoluteAxis(_, axis, value) => {
                     match axis {
                         AbsoluteAxisCode::ABS_MT_POSITION_X => {
-                            touchpad_conf.x = value;
+                            touchpad.x = value;
                             continue;
                         },
                         AbsoluteAxisCode::ABS_MT_POSITION_Y => {
-                            touchpad_conf.y = value;
+                            touchpad.y = value;
                             continue;
                         },
                         _ => {}
@@ -149,6 +195,7 @@ fn main() {
 fn handle_numpad(touchpad: &mut Touchpad) {
     /**** Top Left ****/
     if ((touchpad.x as f64) < 0.06 * (touchpad.max_x as f64)) && ((touchpad.y as f64) < 0.07 * (touchpad.max_y as f64)) {
+        dbg!("Top left");
         if let None = touchpad.touch_start {
             return;
         }
@@ -159,19 +206,28 @@ fn handle_numpad(touchpad: &mut Touchpad) {
         }
 
         touchpad.brightness = match touchpad.brightness {
+            Brightness::OFF => Brightness::LOW,
+            Brightness::ON => Brightness::LOW,
             Brightness::LOW => Brightness::MID,
             Brightness::MID => Brightness::HIGH,
-            Brightness::HIGH => Brightness::LOW,
-            _ => Brightness::LOW,
+            Brightness::HIGH => Brightness::OFF, // Switch it off
         };
 
         change_brightness(touchpad);
+        if Brightness::OFF == touchpad.brightness && touchpad.numlock == true {
+            touchpad.numpad.emit(&[
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_NUMLOCK.0, 1),
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_NUMLOCK.0, 0)
+            ]).unwrap();
+            touchpad.numlock = false;
+        }
 
         return;
     }
 
     /**** Top Right ****/
     if ((touchpad.x as f64) > 0.95 * (touchpad.max_x as f64)) && ((touchpad.y as f64) < 0.09 * (touchpad.max_y as f64)) {
+        dbg!("Top right");
         if let None = touchpad.touch_start {
             return;
         }
@@ -192,8 +248,10 @@ fn handle_numpad(touchpad: &mut Touchpad) {
                 touchpad.numlock = false;
             },
             false => {
+                // Set the light mode
                 touchpad.brightness = Brightness::LOW;
                 change_brightness(touchpad);
+                // Set it to On
                 touchpad.brightness = Brightness::ON;
                 change_brightness(touchpad);
                 touchpad.numpad.emit(&[
@@ -210,10 +268,7 @@ fn handle_numpad(touchpad: &mut Touchpad) {
         return;
     }
 
-    let col = f64::floor(COLS as f64 * touchpad.x as f64 / (touchpad.max_x as f64 + 1.0)) as usize;
-    let row = f64::floor((ROWS as f64 * touchpad.y as f64 / (touchpad.max_y as f64)) - 0.0) as usize;
-
-    let key = NUMPAD_LAYOUT[row][col];
+    let key = NUMPAD_LAYOUT[touchpad.row][touchpad.col];
 
     match key {
         KeyCode::KEY_5 => touchpad.numpad.emit(&[
@@ -221,9 +276,9 @@ fn handle_numpad(touchpad: &mut Touchpad) {
                 InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 1),
                 InputEvent::new(EventType::KEY.0, KeyCode::KEY_5.0, 0),
                 InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0),
-            ]).unwrap(),
+        ]).unwrap(),
 
-        KeyCode::KEY_BACKSPACE => {},
+        KeyCode::KEY_BACKSPACE => { /* Handled above */ },
 
         _ => touchpad.numpad.emit(&[
             InputEvent::new(EventType::KEY.0, key.0, 1),
@@ -234,7 +289,6 @@ fn handle_numpad(touchpad: &mut Touchpad) {
 
 fn change_brightness(touchpad: &Touchpad) {
     let path = format!("/dev/i2c-{}", touchpad.dev_id);
-    dbg!(&path);
     let dev = OpenOptions::new()
         .write(true)
         .read(true)
